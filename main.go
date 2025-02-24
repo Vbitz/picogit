@@ -104,11 +104,6 @@ func newPktLineWriter(writer io.Writer) *pktLineWriter {
 	}
 }
 
-type GitRepository struct {
-	Head    string
-	Objects map[string][]byte
-}
-
 type gitObjectKind byte
 
 const (
@@ -278,6 +273,119 @@ func (p *packFileParser) parse(repo *GitRepository) error {
 	}
 
 	return nil
+}
+
+type GitCommit struct {
+	Tree      string
+	Parents   []string
+	Author    string
+	Committer string
+	Message   string
+}
+
+type GitTreeEntry struct {
+	Mode uint64
+	Type gitObjectKind
+	Hash string
+	Name string
+}
+
+type GitTree struct {
+	Entries []GitTreeEntry
+}
+
+type GitRepository struct {
+	Head    string
+	Objects map[string][]byte
+}
+
+func (r *GitRepository) Commit(hash string) (*GitCommit, error) {
+	obj, ok := r.Objects[hash]
+	if !ok {
+		return nil, fmt.Errorf("object not found: %s", hash)
+	}
+
+	reader := bytes.NewReader(obj)
+
+	scanner := bufio.NewScanner(reader)
+
+	commit := &GitCommit{}
+
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		if line == "" {
+			for scanner.Scan() {
+				commit.Message += scanner.Text() + "\n"
+			}
+			break
+		}
+
+		if strings.HasPrefix(line, "tree ") {
+			commit.Tree = strings.TrimPrefix(line, "tree ")
+		} else if strings.HasPrefix(line, "parent ") {
+			commit.Parents = append(commit.Parents, strings.TrimPrefix(line, "parent "))
+		} else if strings.HasPrefix(line, "author ") {
+			commit.Author = strings.TrimPrefix(line, "author ")
+		} else if strings.HasPrefix(line, "committer ") {
+			commit.Committer = strings.TrimPrefix(line, "committer ")
+		} else {
+			return nil, fmt.Errorf("unexpected line: %s", line)
+		}
+	}
+
+	return commit, nil
+}
+
+func (r *GitRepository) HeadCommit() (*GitCommit, error) {
+	return r.Commit(r.Head)
+}
+
+func (r *GitRepository) Tree(hash string) (*GitTree, error) {
+	obj, ok := r.Objects[hash]
+	if !ok {
+		return nil, fmt.Errorf("object not found: %s", hash)
+	}
+
+	ret := &GitTree{}
+
+	var ent []byte
+	var hashBytes []byte
+	for len(obj) > 0 {
+		// read until \x00
+		tokens := bytes.SplitN(obj, []byte("\x00"), 2)
+		ent, obj = tokens[0], tokens[1]
+
+		mode, name, ok := strings.Cut(string(ent), " ")
+		if !ok {
+			return nil, fmt.Errorf("unexpected entry format: %s", string(ent))
+		}
+
+		hashBytes, obj = obj[:20], obj[20:]
+
+		modeInt, err := strconv.ParseUint(mode, 8, 64)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse mode: %w", err)
+		}
+
+		ret.Entries = append(ret.Entries, GitTreeEntry{
+			Mode: modeInt,
+			Type: gitObjectKindBlob,
+			Hash: hex.EncodeToString(hashBytes),
+			Name: name,
+		})
+	}
+
+	return ret, nil
+}
+
+func (r *GitRepository) Blob(hash string) ([]byte, error) {
+	obj, ok := r.Objects[hash]
+	if !ok {
+		return nil, fmt.Errorf("object not found: %s", hash)
+	}
+
+	return obj, nil
 }
 
 func cloneRepo(urlString string) (*GitRepository, error) {
@@ -454,27 +562,31 @@ func appMain() error {
 		return err
 	}
 
-	_ = repo
+	headCommit, err := repo.HeadCommit()
+	if err != nil {
+		return err
+	}
 
-	// headCommit, err := repo.HeadCommit()
-	// if err != nil {
-	// 	return err
-	// }
+	slog.Info("head commit", "commit", headCommit)
 
-	// slog.Info("head commit", "commit", headCommit)
+	tree, err := repo.Tree(headCommit.Tree)
+	if err != nil {
+		return err
+	}
 
-	// tree, err := repo.Tree(headCommit.Tree)
-	// if err != nil {
-	// 	return err
-	// }
+	slog.Info("tree", "tree", tree)
 
-	// slog.Info("tree", "tree", tree)
+	for _, entry := range tree.Entries {
+		slog.Info("entry", "entry", entry)
+		content, err := repo.Blob(entry.Hash)
+		if err != nil {
+			return err
+		}
 
-	// for _, entry := range tree.Entries {
-	// 	slog.Info("entry", "entry", entry)
-	// }
+		slog.Info("content", "content", string(content))
+	}
 
-	// return nil
+	return nil
 }
 
 func main() {
